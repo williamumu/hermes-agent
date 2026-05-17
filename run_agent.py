@@ -9098,6 +9098,25 @@ class AIAgent:
                 self._transport_cache.clear()
             self._fallback_activated = True
 
+            # Optional per-fallback reasoning override. This lets the primary
+            # provider keep its normal reasoning setting while a reasoning
+            # fallback (for example DeepSeek V4 Pro) runs at a different
+            # effort level only after fallback activation.
+            fb_reasoning_effort = str(fb.get("reasoning_effort") or "").strip()
+            if fb_reasoning_effort:
+                try:
+                    from hermes_constants import parse_reasoning_effort
+
+                    parsed_reasoning = parse_reasoning_effort(fb_reasoning_effort)
+                    if parsed_reasoning is not None:
+                        self.reasoning_config = parsed_reasoning
+                except Exception:
+                    logging.debug(
+                        "Ignoring invalid fallback reasoning_effort=%r",
+                        fb_reasoning_effort,
+                        exc_info=True,
+                    )
+
             # Honor per-provider / per-model request_timeout_seconds for the
             # fallback target (same knob the primary client uses).  None = use
             # SDK default.
@@ -10019,6 +10038,8 @@ class AIAgent:
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None
 
+        self._repair_reasoning_content_for_active_chat_provider(api_messages)
+
         # Strip image parts for non-vision models (no-op when vision-capable).
         _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
 
@@ -10501,6 +10522,22 @@ class AIAgent:
         # 5. reasoning_content was present but not a string (e.g. None after
         # context compaction).  Don't pass null to the API.
         api_msg.pop("reasoning_content", None)
+
+    def _repair_reasoning_content_for_active_chat_provider(self, api_messages: list) -> None:
+        """Re-apply provider-specific reasoning replay rules before send.
+
+        ``api_messages`` is built before the retry loop. If an error activates a
+        DeepSeek/Kimi fallback inside that loop, the next retry reuses the same
+        API-copy messages. Re-run the reasoning-content padding here so the
+        outgoing payload matches the now-active provider.
+        """
+        if not self._needs_thinking_reasoning_pad():
+            return
+        if not isinstance(api_messages, list):
+            return
+        for api_msg in api_messages:
+            if isinstance(api_msg, dict):
+                self._copy_reasoning_content_for_api(api_msg, api_msg)
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:

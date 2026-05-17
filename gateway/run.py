@@ -7814,26 +7814,42 @@ class GatewayRunner:
                         display_reasoning = last_reasoning.strip()
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
-            # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
-            _footer_line = ""
-            try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
-                )
-            except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
-                _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent"):
-                response = f"{response}\n\n{_footer_line}"
+            # Final-message status footer. Prefer the local richer
+            # display.message_status_footer integration (profile/model/provider/
+            # reasoning/tool stats) when configured; otherwise preserve upstream
+            # display.runtime_footer behavior.
+            if response and not agent_result.get("already_sent"):
+                try:
+                    _gateway_cfg = _load_gateway_config()
+                    from gateway.status_footer import append_status_footer, is_status_footer_enabled
+
+                    if is_status_footer_enabled(_gateway_cfg, source.platform):
+                        response = append_status_footer(
+                            response,
+                            agent_result,
+                            _gateway_cfg,
+                            source.platform,
+                            response_time=_response_time,
+                        )
+                    else:
+                        _footer_line = ""
+                        try:
+                            from gateway.runtime_footer import build_footer_line as _bfl
+                            _footer_line = _bfl(
+                                user_config=_gateway_cfg,
+                                platform_key=_platform_config_key(source.platform),
+                                model=agent_result.get("model"),
+                                context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                                context_length=agent_result.get("context_length") or None,
+                                cwd=os.environ.get("TERMINAL_CWD", ""),
+                            )
+                        except Exception as _footer_err:
+                            logger.debug("runtime_footer build failed: %s", _footer_err)
+                            _footer_line = ""
+                        if _footer_line:
+                            response = f"{response}\n\n{_footer_line}"
+                except Exception as _status_footer_err:
+                    logger.debug("status footer append failed: %s", _status_footer_err)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -15748,6 +15764,32 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _compression_count = (
+                getattr(_agent.context_compressor, "compression_count", 0)
+                if (_agent and hasattr(_agent, "context_compressor"))
+                else 0
+            )
+
+            # Resolve active profile name and active reasoning config for the
+            # richer Feishu status footer. When fallback is active, the agent's
+            # reasoning_config reflects the fallback provider's effort (for
+            # example xhigh), whereas gateway self._reasoning_config is the
+            # original primary config loaded before fallback activation.
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile_name = get_active_profile_name()
+            except Exception:
+                _profile_name = None
+
+            def _resolve_result_reasoning_config(_agent):
+                if _agent is not None:
+                    rc = getattr(_agent, "reasoning_config", None)
+                    if rc is not None:
+                        return rc
+                return getattr(self, "_reasoning_config", None)
+
+            _agent_provider = getattr(_agent, "provider", None) if _agent else None
+            _config_provider = (user_config.get("model") or {}).get("provider") if user_config else None
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -15768,7 +15810,12 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": _agent_provider,
+                    "config_provider": _config_provider,
                     "context_length": _context_length,
+                    "compression_count": _compression_count,
+                    "reasoning_config": _resolve_result_reasoning_config(_agent),
+                    "profile": _profile_name,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -15887,9 +15934,14 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _agent_provider,
+                "config_provider": _config_provider,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "compression_count": _compression_count,
+                "reasoning_config": _resolve_result_reasoning_config(_agent),
+                "profile": _profile_name,
             }
         
         # Start progress message sender if enabled

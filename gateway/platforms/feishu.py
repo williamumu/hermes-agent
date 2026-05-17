@@ -154,7 +154,9 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 # Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Feishu post-type 'md' elements do not render tables. Keep the overall message
+# as post, but emit table blocks as plain text rows so surrounding markdown still
+# renders instead of downgrading the whole message to text.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
@@ -559,6 +561,76 @@ def _build_markdown_post_payload(content: str) -> str:
 
 
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
+    if not _MARKDOWN_TABLE_RE.search(content):
+        return _build_markdown_non_table_post_rows(content)
+
+    rows: List[List[Dict[str, str]]] = []
+    current: List[str] = []
+    lines = content.splitlines()
+    i = 0
+    in_code_block = False
+
+    def _flush_markdown_current() -> None:
+        nonlocal current
+        if not current:
+            return
+        segment = "\n".join(current).strip("\n")
+        if segment.strip():
+            rows.extend(_build_markdown_non_table_post_rows(segment))
+        current = []
+
+    while i < len(lines):
+        raw_line = lines[i]
+        stripped_line = raw_line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped_line)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped_line)
+        )
+        if is_fence:
+            current.append(raw_line)
+            in_code_block = not in_code_block
+            i += 1
+            continue
+
+        if not in_code_block and _is_markdown_table_start(lines, i):
+            _flush_markdown_current()
+            table_lines = [lines[i], lines[i + 1]]
+            i += 2
+            while i < len(lines) and _is_markdown_table_row(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            rows.append([{"tag": "text", "text": "\n".join(table_lines)}])
+            continue
+
+        current.append(raw_line)
+        i += 1
+
+    _flush_markdown_current()
+    return rows or [[{"tag": "md", "text": content}]]
+
+
+def _is_markdown_table_start(lines: List[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and _is_markdown_table_row(lines[index])
+        and _is_markdown_table_separator(lines[index + 1])
+    )
+
+
+def _is_markdown_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    stripped = line.strip()
+    if not _is_markdown_table_row(stripped):
+        return False
+    return bool(stripped) and all(ch in "|:- " for ch in stripped)
+
+
+def _build_markdown_non_table_post_rows(content: str) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows while isolating fenced code blocks.
 
     Feishu's `md` renderer can swallow trailing content when a fenced code block
@@ -579,7 +651,7 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
         nonlocal current
         if not current:
             return
-        segment = "\n".join(current)
+        segment = "\n".join(current).strip("\n")
         if segment.strip():
             rows.append([{"tag": "md", "text": segment}])
         current = []
@@ -2977,7 +3049,12 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # Feishu uses ``thread_id`` for actual chat topics/threads (typically
+        # ``omt_...``). ``root_id`` is also present on ordinary message replies
+        # (typically ``om_...``); treating it as a session thread splits a normal
+        # DM into pseudo-thread sessions and makes main-chat/topic routing look
+        # crossed. Keep root_id only as reply context below.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -4222,13 +4299,10 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
+        # Feishu post-type 'md' elements do not render markdown tables, but
+        # _build_markdown_post_payload emits table blocks as plain text rows so
+        # surrounding markdown still renders instead of downgrading everything.
+        if _MARKDOWN_HINT_RE.search(content) or _MARKDOWN_TABLE_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
