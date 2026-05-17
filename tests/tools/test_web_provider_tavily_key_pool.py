@@ -24,10 +24,10 @@ def test_tavily_request_rotates_and_falls_back_on_quota(monkeypatch):
     monkeypatch.setattr(provider, "_TAVILY_KEY_CURSOR", 0)
 
     quota_response = MagicMock()
-    quota_response.status_code = 429
-    quota_response.text = "quota exceeded"
+    quota_response.status_code = 432
+    quota_response.text = "usage limit exceeded"
     quota_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-        "429 Too Many Requests",
+        "432 Usage Limit Exceeded",
         request=MagicMock(),
         response=quota_response,
     )

@@ -102,7 +102,7 @@ def _is_tavily_key_retryable(exc: Exception) -> bool:
     """Return True when trying the next key could plausibly succeed."""
     if isinstance(exc, httpx.HTTPStatusError):
         status = getattr(exc.response, "status_code", None)
-        if status in {401, 402, 403, 429}:
+        if status in {401, 402, 403, 429, 432}:
             return True
         try:
             body = exc.response.text.lower()
