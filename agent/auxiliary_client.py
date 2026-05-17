@@ -1322,46 +1322,31 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+    """Resolve a usable Codex OAuth access token via the runtime resolver.
 
-    If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    This intentionally shares the same refresh path as the main
+    ``openai-codex`` provider. It avoids the historical bug where auxiliary,
+    vision, and image-generation code read stale/exhausted pool entries while
+    the main model path could still refresh Codex OAuth successfully.
     """
+    try:
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+
+        creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+        token = creds.get("api_key")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    except Exception as exc:
+        logger.debug("Could not resolve Codex auth via runtime resolver: %s", exc)
+
+    # Last-ditch compatibility fallback: if the resolver failed, allow a
+    # currently selected pool entry to keep working for custom/manual setups.
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
-
-    try:
-        from hermes_cli.auth import _read_codex_tokens
-        data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
-        if not isinstance(access_token, str) or not access_token.strip():
-            return None
-
-        # Check JWT expiry — expired tokens block the auto chain and
-        # prevent fallback to working providers (e.g. Anthropic).
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
-
-        return access_token.strip()
-    except Exception as exc:
-        logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
-        return None
+    return None
 
 
 def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -1858,21 +1843,10 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        codex_token = _pool_runtime_api_key(entry)
-        if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
-        else:
-            codex_token = _read_codex_access_token()
-            if not codex_token:
-                return None, None
-            base_url = _CODEX_AUX_BASE_URL
-    else:
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            return None, None
-        base_url = _CODEX_AUX_BASE_URL
+    codex_token = _read_codex_access_token()
+    if not codex_token:
+        return None, None
+    base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
     real_client = OpenAI(
         api_key=codex_token,

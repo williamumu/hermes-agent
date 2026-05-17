@@ -1037,7 +1037,11 @@ def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
-    should_use_pool = provider != "openrouter"
+    # OpenAI Codex OAuth is single-use-refresh-token backed. In shared-auth
+    # mode the canonical resolver owns refresh/locking; selecting profile-local
+    # pool entries here can resurrect stale/exhausted token copies and bypass
+    # that resolver. Treat Codex like a singleton runtime credential.
+    should_use_pool = provider not in {"openrouter", "openai-codex"}
     if provider == "openrouter":
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
@@ -1130,6 +1134,30 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
         except AuthError:
+            # If the canonical Codex resolver has no login but the user/tests
+            # supplied an explicit manual pool entry, preserve that fallback.
+            # With a valid shared store this branch is never reached, so stale
+            # profile-local pools cannot preempt shared refresh.
+            try:
+                fallback_pool = load_pool(provider)
+                if fallback_pool and fallback_pool.has_credentials():
+                    fallback_entry = fallback_pool.select()
+                    if fallback_entry is not None:
+                        pool_api_key = (
+                            getattr(fallback_entry, "runtime_api_key", None)
+                            or getattr(fallback_entry, "access_token", "")
+                        )
+                        if pool_api_key:
+                            return _resolve_runtime_from_pool_entry(
+                                provider=provider,
+                                entry=fallback_entry,
+                                requested_provider=requested_provider,
+                                model_cfg=model_cfg,
+                                pool=fallback_pool,
+                                target_model=target_model,
+                            )
+            except Exception:
+                pass
             if requested_provider != "auto":
                 raise
             # Auto-detected Codex but credentials are stale/revoked —
